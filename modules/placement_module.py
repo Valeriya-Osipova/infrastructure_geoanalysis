@@ -1,18 +1,23 @@
 import os
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Any
 import geopandas as gpd
 from shapely.geometry import shape, Point
 from scipy.spatial import KDTree
 import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESIDENTIAL_GDF = gpd.read_file(os.path.join(BASE_DIR, "../data/residential_buildings_points.geojson")).set_crs(epsg=4326, allow_override=True)
-LOW_DENSITY_GDF = gpd.read_file(os.path.join(BASE_DIR, "../data/final_areas.geojson")).set_crs(epsg=4326, allow_override=True)
-# Если есть крупные дороги OSM (primary/secondary)
-ROADS_GDF = gpd.read_file(os.path.join(BASE_DIR, "../data/road_big_nodes.geojson")).set_crs(epsg=4326, allow_override=True)
+RESIDENTIAL_GDF = gpd.read_file(
+    os.path.join(BASE_DIR, "../data/residential_buildings_points.geojson")
+).set_crs(epsg=4326, allow_override=True)
+LOW_DENSITY_GDF = gpd.read_file(
+    os.path.join(BASE_DIR, "../data/final_areas.geojson")
+).set_crs(epsg=4326, allow_override=True)
 
 def find_residential_clusters(gdf: gpd.GeoDataFrame, radius_meters: float = 200, min_cluster_size: int = 3) -> List[Tuple[float, float]]:
     """Находит скопления домов и возвращает центроиды таких кластеров"""
+    if len(gdf) == 0:
+        return []
+    
     centroid = gdf.unary_union.centroid
     utm_zone = int((centroid.x + 180) / 6) + 1
     utm_epsg = 32600 + utm_zone
@@ -34,116 +39,167 @@ def find_residential_clusters(gdf: gpd.GeoDataFrame, radius_meters: float = 200,
             cluster_centroids.append(centroid_cluster)
             visited.update(indices)
     
-    cluster_points_geom = gpd.GeoSeries([Point(x, y) for x, y in cluster_centroids], crs=utm_epsg)
+    if not cluster_centroids:
+        return []
+    
+    cluster_points_geom = gpd.GeoSeries(
+        [Point(x, y) for x, y in cluster_centroids], 
+        crs=utm_epsg
+    )
     cluster_points_geom = cluster_points_geom.to_crs(epsg=4326)
     
     return [(pt.x, pt.y) for pt in cluster_points_geom]
 
-def suggest_kindergarten(iso_feature: dict) -> Dict:
+def suggest_kindergarten(iso_feature: dict) -> Dict[str, Any]:
+    """Предложения по размещению детского сада"""
     print("Suggesting kindergarten locations...")
     polygon = shape(iso_feature["geometry"])
-    cluster_centers = find_residential_clusters(RESIDENTIAL_GDF)
-    recommended_sites = [pt for pt in cluster_centers if polygon.contains(Point(pt))]
     
+    # 1. Ищем кластеры жилых зданий в изохронной зоне
+    recommended_sites = []
     criteria_used = []
-    if recommended_sites:
-        criteria_used.append("clustered residential buildings within 500m walk isochrone")
-    else:
-        criteria_used.append("fallback: full isochrone")
+    
+    # Получаем жилые здания в изохронной зоне
+    residential_in_zone = RESIDENTIAL_GDF[
+        RESIDENTIAL_GDF.geometry.apply(lambda x: polygon.contains(Point(x.x, x.y)) if hasattr(x, 'x') else polygon.contains(x))
+    ]
+    
+    if not residential_in_zone.empty:
+        # Находим кластеры среди этих зданий
+        cluster_centers = find_residential_clusters(residential_in_zone)
+        recommended_sites.extend(cluster_centers)
+        if cluster_centers:
+            criteria_used.append("clustered residential buildings within 500m walk isochrone")
+    
+    if not recommended_sites:
+        # 2. Fallback: возвращаем всю изохронную зону
+        criteria_used.append("fallback: full isochrone zone")
     
     return {
         "recommended_sites": recommended_sites,
-        "fallback_zone": iso_feature,
+        "fallback_zone": iso_feature if not recommended_sites else None,
         "criteria_used": criteria_used
     }
 
-def suggest_school_or_college(iso_walk: dict, iso_drive: dict) -> Dict:
-    print("Suggesting school/college locations...")
+def suggest_school(iso_walk: dict, iso_drive: dict) -> Dict[str, Any]:
+    """Предложения по размещению школы"""
+    print("Suggesting school locations...")
     walk_polygon = shape(iso_walk["geometry"])
     drive_polygon = shape(iso_drive["geometry"])
     
     recommended_sites = []
     criteria_used = []
-
-    cluster_centers = find_residential_clusters(RESIDENTIAL_GDF)
-    for pt in cluster_centers:
-        if drive_polygon.contains(Point(pt)):
-            recommended_sites.append(pt)
-    if cluster_centers:
-        criteria_used.append("clustered residential buildings within drive isochrone")
-
-    centers = LOW_DENSITY_GDF.centroid
-    for pt in centers:
-        point = Point(pt.x, pt.y)
-        if walk_polygon.contains(point):
-            recommended_sites.append((pt.x, pt.y))
-            criteria_used.append("low density zone within walk isochrone")
-        elif drive_polygon.contains(point):
-            recommended_sites.append((pt.x, pt.y))
-            criteria_used.append("low density zone within drive isochrone")
-
-    roads_in_iso = ROADS_GDF[ROADS_GDF.intersects(drive_polygon)]
-    for geom in roads_in_iso.geometry:
-        recommended_sites.append((geom.x, geom.y))
-    if not roads_in_iso.empty:
-        criteria_used.append("road nodes within drive isochrone")
-
+    
+    # 1. Центры малонаселенных зон в пешей доступности
+    for idx, row in LOW_DENSITY_GDF.iterrows():
+        center = row.geometry.centroid
+        if walk_polygon.contains(center):
+            recommended_sites.append((center.x, center.y))
+            criteria_used.append(f"zone_{idx}_center within walk isochrone")
+            break  # Берем первую подходящую
+    
+    # 2. Кластеры жилых зданий в транспортной доступности
     if not recommended_sites:
-        criteria_used.append("fallback: full drive isochrone")
-
+        residential_in_drive = RESIDENTIAL_GDF[
+            RESIDENTIAL_GDF.geometry.apply(lambda x: drive_polygon.contains(Point(x.x, x.y)) if hasattr(x, 'x') else drive_polygon.contains(x))
+        ]
+        
+        if not residential_in_drive.empty:
+            cluster_centers = find_residential_clusters(residential_in_drive)
+            if cluster_centers:
+                recommended_sites.extend(cluster_centers[:3])  # Берем первые 3 кластера
+                criteria_used.append("clustered residential buildings within drive isochrone")
+    
+    if not recommended_sites:
+        # 3. Fallback: возвращаем транспортную изохронную зону
+        criteria_used.append("fallback: full drive isochrone zone")
+    
     return {
         "recommended_sites": recommended_sites,
-        "fallback_zone": iso_drive,
+        "fallback_zone": iso_drive if not recommended_sites else None,
         "criteria_used": criteria_used
     }
 
-def suggest_hospital(iso_drive: dict) -> Dict:
-    print("Suggesting hospital locations...")
-    drive_polygon = shape(iso_drive["geometry"])
-    centers = LOW_DENSITY_GDF.centroid
+def suggest_hospital(iso_feature: dict) -> Dict[str, Any]:
+    """Предложения по размещению ФАПа (пешая 2км доступность)"""
+    print("Suggesting FAP locations...")
+    polygon = shape(iso_feature["geometry"])  # Пешая 2км изохрона
+    
     recommended_sites = []
     criteria_used = []
-
-    for pt in centers:
-        point = Point(pt.x, pt.y)
-        if drive_polygon.contains(point):
-            recommended_sites.append((pt.x, pt.y))
-            criteria_used.append("low density zone within 30min drive isochrone")
-
-    roads_in_iso = ROADS_GDF[ROADS_GDF.intersects(drive_polygon)]
-    if not roads_in_iso.empty:
-        for geom in roads_in_iso.geometry:
-            recommended_sites.append((geom.x, geom.y))
-        criteria_used.append("road nodes within 30min drive isochrone")
-
+    
+    # 1. Центр малонаселенной зоны
+    for idx, row in LOW_DENSITY_GDF.iterrows():
+        center = row.geometry.centroid
+        if polygon.contains(center):
+            recommended_sites.append((center.x, center.y))
+            criteria_used.append(f"zone_{idx}_center within 2km walk isochrone")
+            break  # Берем первую подходящую
+    
+    # 2. Кластеры жилых зданий
     if not recommended_sites:
-        criteria_used.append("fallback: full 30min drive isochrone")
-
+        residential_in_zone = RESIDENTIAL_GDF[
+            RESIDENTIAL_GDF.geometry.apply(lambda x: polygon.contains(Point(x.x, x.y)) if hasattr(x, 'x') else polygon.contains(x))
+        ]
+        
+        if not residential_in_zone.empty:
+            cluster_centers = find_residential_clusters(residential_in_zone)
+            if cluster_centers:
+                recommended_sites.extend(cluster_centers[:2])  # Берем первые 2 кластера
+                criteria_used.append("clustered residential buildings within 2km walk isochrone")
+    
+    if not recommended_sites:
+        # 3. Fallback: возвращаем всю изохронную зону
+        criteria_used.append("fallback: full 2km walk isochrone zone")
+    
     return {
         "recommended_sites": recommended_sites,
-        "fallback_zone": iso_drive,
+        "fallback_zone": iso_feature if not recommended_sites else None,
         "criteria_used": criteria_used
     }
 
-def placement_suggestions(object_type: str, iso_walk: dict = None, iso_drive: dict = None) -> Dict:
+def generate_placement_suggestions(accessibility_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Предложения по размещению новых объектов.
+    Генерирует рекомендации по размещению для объектов с нарушенными нормативами
     
-    Parameters
-    ----------
-    object_type : 'kindergarten' | 'school' | 'college' | 'hospital'
-    iso_walk : GeoJSON Feature пешей доступности
-    iso_drive : GeoJSON Feature транспортной доступности
+    Parameters:
+        accessibility_result: результат функции analyze_accessibility
+        
+    Returns:
+        Обновленный словарь с заполненными полями "suggestions" для объектов с ok=False
+    """
+    result = accessibility_result.copy()
     
-    Returns
-    -------
-    dict: {recommended_sites, fallback_zone, criteria_used}
+    # Для детского сада
+    if not result["kindergarten"]["ok"]:
+        suggestions = suggest_kindergarten(result["kindergarten"]["iso"])
+        result["kindergarten"]["suggestions"] = suggestions
+    
+    # Для школы
+    if not result["school"]["ok"]:
+        suggestions = suggest_school(
+            result["school"]["iso_walk"],
+            result["school"]["iso_drive"]
+        )
+        result["school"]["suggestions"] = suggestions
+    
+    # Для ФАПа
+    if not result["hospital"]["ok"]:
+        suggestions = suggest_hospital(result["hospital"]["iso"])
+        result["hospital"]["suggestions"] = suggestions
+    
+    return result
+
+def placement_suggestions(object_type: str, iso_walk: dict = None, iso_drive: dict = None) -> Dict[str, Any]:
+    """
+    Устаревшая функция для обратной совместимости.
+    Рекомендуется использовать generate_placement_suggestions()
     """
     if object_type == "kindergarten":
         return suggest_kindergarten(iso_walk)
-    elif object_type in ["school", "college"]:
-        return suggest_school_or_college(iso_walk, iso_drive)
+    elif object_type == "school":
+        return suggest_school(iso_walk, iso_drive)
     elif object_type == "hospital":
-        return suggest_hospital(iso_drive)
+        return suggest_hospital(iso_walk)  # Для ФАПа используем пешую изохрону
     else:
         raise ValueError(f"Unknown object type: {object_type}")
