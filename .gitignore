@@ -7,3 +7,4 @@ cache/
 *.pyc
 drive_graph/
 walk_graph/
+*.html
